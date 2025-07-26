@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import math
 from datetime import datetime
 from wordfreq import top_n_list
 import numpy as np
@@ -30,23 +31,176 @@ class SystemParams():
     time_grid = None
 
 class DeepLSTMController(nn.Module):
-    def __init__(self, hidden=48, num_layers=2, dropout=0.1):
+    def __init__(self,
+                 hidden=64,
+                 num_layers=1,
+                 dropout=0.0,
+                 lag_len=4,              # number of raw past states to keep (including current)
+                 use_weighted_hist=True,
+                 decay=0.95,             # decay factor for wgt_x_hist
+                 use_ema=True,
+                 warmup_steps=3,          # synthetic warm-up passes
+                 time_feats=('raw','sin','cos'),  # which time encodings
+                 learn_u0=True,
+                 constrain='none',       # 'none' | 'tanh' | 'relu'
+                 ):
         super().__init__()
-        self.hidden_size, self.num_layers = hidden, num_layers
-        self.rnn = nn.LSTM(2, hidden, num_layers, dropout=dropout, batch_first=True)
-        self.head = nn.Sequential(nn.Linear(hidden, hidden//2), nn.SiLU(), nn.Linear(hidden//2, 1))
-        self.h = None
+        self.hidden_size = hidden
+        self.num_layers = num_layers
+        self.lag_len = lag_len
+        self.use_weighted_hist = use_weighted_hist
+        self.decay = decay
+        self.use_ema = use_ema
+        self.warmup_steps = warmup_steps
+        self.time_feats = time_feats
+        self.learn_u0 = learn_u0
+        self.constrain = constrain
 
-    def reset_state(self, B):
-        z = torch.zeros(self.num_layers, B, self.hidden_size, device=self.head[0].weight.device)
-        self.h = (z.clone(), z.clone())
+        # ---- learnable initial hidden/cell
+        self.h0 = nn.Parameter(torch.zeros(num_layers, 1, hidden))
+        self.c0 = nn.Parameter(torch.zeros(num_layers, 1, hidden))
 
-    def forward(self, tau, x):
-        if self.h is None or self.h[0].size(1) != tau.size(0): self.reset_state(tau.size(0))
-        out, self.h = self.rnn(
-            torch.stack([tau, x], -1).unsqueeze(1), self.h
+        # ---- optional learned u0 parameter
+        if learn_u0:
+            self.u0_param = nn.Parameter(torch.zeros(1))
+
+        # We will build feature dimension dynamically
+        # Base mandatory feature: current x
+        feat_dim = 1
+
+        if lag_len > 1:
+            feat_dim += (lag_len - 1)       # additional past states
+        if use_weighted_hist:
+            feat_dim += lag_len             # decayed weighted history window
+        if use_ema:
+            feat_dim += 1
+        # time features
+        feat_dim += len(time_feats)
+
+        self.rnn = nn.LSTM(feat_dim, hidden, num_layers,
+                           dropout=dropout if num_layers > 1 else 0.0,
+                           batch_first=True)
+
+        self.head = nn.Sequential(
+            nn.Linear(hidden, hidden//2),
+            nn.SiLU(),
+            nn.Linear(hidden//2, 1)
         )
-        return self.head(out.squeeze(1)).squeeze(-1)
+
+        self.register_buffer('step', torch.zeros(1, dtype=torch.long), persistent=False)
+        self._init_buffers_done = False
+
+    # ---------------------------------------------------------
+    def reset_state(self, B):
+        device = self.h0.device
+        self.h = (self.h0.expand(-1, B, -1).contiguous(),
+                  self.c0.expand(-1, B, -1).contiguous())
+        self.step.zero_()
+        # allocate buffers
+        self.x_lag = torch.zeros(B, self.lag_len, device=device)
+        if self.use_weighted_hist:
+            self.wgt_hist = torch.zeros(B, self.lag_len, device=device)
+        if self.use_ema:
+            self.ema = torch.zeros(B, device=device)
+        # lazy warm-up will happen on first forward
+        self._init_buffers_done = True
+
+    # ---------------------------------------------------------
+    def _build_time_feats(self, tau):
+        feats = []
+        for k in self.time_feats:
+            if k == 'raw':
+                feats.append(tau)
+            elif k == 'sin':
+                feats.append(torch.sin(math.pi * tau))
+            elif k == 'cos':
+                feats.append(torch.cos(math.pi * tau))
+            elif k == 'tau2':
+                feats.append(tau * tau)
+        return torch.stack(feats, -1) if feats else torch.zeros_like(tau).unsqueeze(-1)
+
+    # ---------------------------------------------------------
+    def _maybe_warmup(self, tau, x):
+        if self.warmup_steps <= 0:
+            return
+        # Use repeated x with negative pseudo-times
+        B = x.size(0)
+        feat_seq = []
+        # replicate history buffers as if already advanced
+        for i in range(self.warmup_steps):
+            pseudo_tau = torch.full_like(x, - (i+1)/self.warmup_steps)  # in [-1,0)
+            feat = self._assemble_features(pseudo_tau, x, warmup_mode=True)
+            feat_seq.append(feat.unsqueeze(1))
+        seq = torch.cat(feat_seq, 1)  # (B, warmup_steps, feat_dim)
+        _, self.h = self.rnn(seq, self.h)
+
+    # ---------------------------------------------------------
+    def _assemble_features(self, tau, x, warmup_mode=False):
+        B = x.size(0)
+        # On first ever call (real step==0), initialize buffers with x
+        if (self.step.item() == 0) and (not warmup_mode):
+            self.x_lag[:] = x.unsqueeze(1).expand(-1, self.lag_len)
+            if self.use_weighted_hist:
+                self.wgt_hist[:] = x.unsqueeze(1).expand(-1, self.lag_len)
+            if self.use_ema:
+                self.ema[:] = x
+
+        if (self.step.item() > 0) and (not warmup_mode):
+            if self.lag_len > 1:
+                self.x_lag[:, :-1].copy_(self.x_lag[:, 1:].clone())
+            self.x_lag[:, -1] = x
+
+            if self.use_weighted_hist:
+                if self.lag_len > 1:
+                    self.wgt_hist[:, :-1].copy_((self.wgt_hist[:, 1:] * self.decay).clone())
+                # even if lag_len == 1, just overwrite last slot
+                self.wgt_hist[:, -1] = x
+            if self.use_ema:
+                self.ema = self.decay * self.ema + (1 - self.decay) * x
+
+
+        feats = [x]  # current state always first
+        if self.lag_len > 1:
+            # exclude current x (already added) => previous (lag_len-1)
+            feats.append(self.x_lag[:, :-1])
+        if self.use_weighted_hist:
+            feats.append(self.wgt_hist)
+        if self.use_ema:
+            feats.append(self.ema.unsqueeze(-1))
+        feats.append(self._build_time_feats(tau))
+        return torch.cat([f if f.dim() == 2 else f.view(B, -1) for f in feats], dim=1)
+
+    # ---------------------------------------------------------
+    def forward(self, tau, x):
+        """
+        tau, x : (B,)
+        Returns control (B,)
+        """
+        if (not self._init_buffers_done) or (self.h[0].size(1) != x.size(0)):
+            self.reset_state(x.size(0))
+
+        # Warm-up just once at beginning
+        if self.step.item() == 0 and self.warmup_steps > 0:
+            self._maybe_warmup(tau, x)
+
+        # If using learned u0 and this is the first *real* step, short-circuit
+        if self.learn_u0 and self.step.item() == 0:
+            u0 = self.u0_param.expand_as(x)
+            self.step += 1
+            return self._apply_constraint(u0)
+
+        feat = self._assemble_features(tau, x)
+        out, self.h = self.rnn(feat.unsqueeze(1), self.h)
+        u = self.head(out.squeeze(1)).squeeze(-1)
+        self.step += 1
+        return self._apply_constraint(u)
+
+    def _apply_constraint(self, u):
+        if self.constrain == 'tanh':
+            return torch.tanh(u)
+        if self.constrain == 'relu':
+            return torch.relu(u)
+        return u
     
 def compute_a_grid(params):
     if getattr(params, 'a_grid', None) is not None:
@@ -103,11 +257,13 @@ class LeaderLBSolver:
         self.Cv = torch.tensor([[params.sig_L], [0.0], [0.0]], device=params.device)
         self.C_flat = self.Cv.squeeze()
 
+        # grids h(t) and k(t)
         F_int = torch.cumsum(self.f_grid[:-1], 0) * params.dt
         F_int = torch.cat([torch.tensor([0.0], device=params.device), F_int])
         self.h_grid = params.Q_F * torch.exp(F_int)
         self.k_grid = torch.exp(-2.0 * F_int)
 
+        # pre‑computed running‑cost diagonal (time‑independent part)
         self.Q_diag = torch.tensor(
             [[0.5 * params.Q_L, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
             device=params.device,
@@ -125,6 +281,7 @@ class LeaderLBSolver:
             device=params.device,
         )
 
+    # ---------------------------------------------------- backward Riccati sweep
     def _compute_ric_functions(self):
         params = self.params
         # N, dt, device = params.N, params.dt, params.device
@@ -135,6 +292,7 @@ class LeaderLBSolver:
         self.M_t = torch.zeros(params.N + 1, 3, device=params.device)
         self.N_t = torch.zeros(params.N + 1, 1, device=params.device)
 
+        # terminal conditions ----------------------------------------------------
         int_K = int_trapz(self.k_grid, dx=params.dt)  # ∫_0^T k(t) dt
 
         L_T = torch.zeros(3, 3, device=params.device)
@@ -149,10 +307,14 @@ class LeaderLBSolver:
         )
         self.N_t[-1] = 0.5 * params.Q_L_T * self.F_grid[-1] ** 2
 
+        # backward propagation ---------------------------------------------------
         for j in range(params.N, 0, -1):
             Lj, Mj, Aj = self.L_t[j], self.M_t[j], self._A_mat(j)
+
+            # ---- L -------------------------------------------------------------
             Qj = self.Q_diag.clone()
             Qj[1, 1] = -(params.B_F**4 / (params.sig_F**2 * params.R_F**2)) * params.lamb_L * self.k_grid[j]
+
             dL = -(
                 Lj @ Aj
                 + Aj.T @ Lj
@@ -160,6 +322,8 @@ class LeaderLBSolver:
                 + Qj
             )
             self.L_t[j - 1] = Lj - params.dt * dL
+
+            # ---- M -------------------------------------------------------------
             vec_F = torch.tensor([-params.Q_L * self.F_grid[j], 0.0, 0.0], device=params.device)
             dM = -(
                 Aj.T @ Mj
@@ -167,6 +331,8 @@ class LeaderLBSolver:
                 + vec_F
             )
             self.M_t[j - 1] = Mj - params.dt * dM
+
+
             BT_M = (self.B_flat * Mj).sum()
             dN = (
                 (BT_M**2) / (2.0 * params.R_L)
@@ -198,6 +364,7 @@ class LeaderLBSolver:
         Xs[:, 0] = X
 
         dW = torch.randn((batch, params.N), device=params.device) * (params.dt**0.5)
+        dW[:, 0] = 0.0  # no noise at t=0
 
         for k in range(params.N):
             r = torch.stack((X, Y, Z), dim=1) 
@@ -208,22 +375,22 @@ class LeaderLBSolver:
             Z = Z + self.k_grid[k] * Y * params.dt
             X += (params.A_L * X + params.B_L * u) * params.dt + params.sig_L * dW[:, k]
             Xs[:, k + 1] = X
-        return Xs, Us
+        return Xs[:, 1:], Us[:, 1:]
 
 def exact_leader_total_cost(X_L, U_L, params, F):
-    """Variance minimization task"""
-    F_grid = F(torch.arange(params.N + 1, device=params.device))
+    """total cost (not lower bound approx)"""
+    F_grid = F(params.time_grid)
     a_grid = compute_a_grid(params)
     b = compute_b_grid(params, a_grid, X_L)
     g = b / params.M_true
-    cost = (params.B_F**4 / (params.sig_F**2 * params.R_F**2)) * (params.lamb_L / int_trapz(g**2, dx=params.dt)).mean() \
-            + (params.Q_L / 2) * int_trapz((X_L - F_grid)**2, dx=params.dt).mean() \
-            + (params.R_L / 2) * int_trapz(U_L**2, dx=params.dt).mean()
+    cost = (params.B_F**4 / (params.sig_F**2 * params.R_F**2)) * (params.lamb_L / int_trapz(g**2, dx=params.dt, dim=1)).mean() \
+            + (params.Q_L / 2) * int_trapz((X_L - F_grid)**2, dx=params.dt, dim=1).mean() \
+            + (params.R_L / 2) * int_trapz(U_L**2, dx=params.dt, dim=1).mean()
     return cost
 
 def lb_leader_total_cost(X_L, U_L, params, F):
-    """Fisher Information Maximization task"""
-    F_grid = F(torch.arange(params.N + 1, device=params.device))
+    """lower bound cost, after applying Jensen's inequality"""
+    F_grid = F(torch.linspace(0, params.T, X_L.shape[1], device=params.device))
     a_grid = compute_a_grid(params)
     b = compute_b_grid(params, a_grid, X_L)
     g = b / params.M_true
@@ -235,27 +402,31 @@ def lb_leader_total_cost(X_L, U_L, params, F):
 def simulate_leader(control, params, batch, seed):
     torch.manual_seed(seed)
     dW = torch.randn(batch, params.N, device=params.device) * (params.dt**0.5)
+    dW[:, 0] = 0.0  # no noise at t=0
+
     X_L = torch.empty(batch, params.N + 1, device=params.device)
     U_L = torch.empty(batch, params.N, device=params.device)
-    X_L[:, 0] = torch.full((batch,), params.X_L_0, device=params.device)
+    X_L[:, :2] = torch.full((batch,2), params.X_L_0, device=params.device)
     
     for k in range(params.N):
         u = control(k, X_L[:, k])
         U_L[:, k] = u
 
         X_L[:, k + 1] = X_L[:, k] + (params.A_L * X_L[:, k] + params.B_L * u) * params.dt + params.sig_L * dW[:, k]
+    X_L, U_L = X_L[:, 1:], U_L[:, 1:]
+    X_L[:, 0] = torch.full((batch,), params.X_L_0, device=params.device)
     return X_L, U_L
 
 def simulate_follower(X_L, params, batch, seed):
-    """Use exploratory policy of the follower"""
+    """Take mean of follower control"""
     torch.manual_seed(seed)
-    X_F = torch.empty(batch, params.N + 1, device=params.device)
+    X_F = torch.empty(batch, X_L.shape[1], device=params.device)
     X_F[:, 0] = torch.full((batch,), params.X_F_0, device=params.device)
-    U_F = torch.empty(batch, params.N, device=params.device)
-    dW = torch.randn(batch, params.N, device=params.device) * (params.dt**0.5)
+    U_F = torch.empty(batch, X_L.shape[1]-1, device=params.device)
+    dW = torch.randn(batch, X_L.shape[1]-1, device=params.device) * (params.dt**0.5)
     a_grid = compute_a_grid(params)
     b_grid = compute_b_grid(params, a_grid, X_L)
-    for k in range(params.N):
+    for k in range(X_L.shape[1]-1):
         U_F[:, k] = torch.tensor((-params.B_F / params.R_F) * (2 * a_grid[k] * X_F[:, k] + b_grid[:, k]), device=params.device)
         X_F[:, k + 1] = X_F[:, k] + (params.A_F * X_F[:, k] + params.B_F * U_F[:, k]) * params.dt + params.sig_F * dW[:, k]
     return X_F, U_F
@@ -388,3 +559,13 @@ def estimate_I_batch(X_L_paths, params):
     g2 = (b / params.M_true) ** 2
     I_paths = (params.B_F**4)/(params.sig_F**2 * params.R_F**2) * int_trapz(g2, dx=params.dt)
     return I_paths.mean().item()
+
+@torch.no_grad()
+def estimate_var(X_L_paths, params):
+    # variance of hat{M}
+    a_grid = compute_a_grid(params)
+    b = compute_b_grid(params, a_grid, X_L_paths)
+    g2 = (b / params.M_true) ** 2
+    var_paths = 1/((params.B_F**4)/(params.sig_F**2 * params.R_F**2) * int_trapz(g2, dx=params.dt))
+    print(var_paths.mean().item(), params.lamb_L)
+    return var_paths.mean().item()
