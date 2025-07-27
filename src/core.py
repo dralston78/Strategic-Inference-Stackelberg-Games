@@ -567,5 +567,4 @@ def estimate_var(X_L_paths, params):
     b = compute_b_grid(params, a_grid, X_L_paths)
     g2 = (b / params.M_true) ** 2
     var_paths = 1/((params.B_F**4)/(params.sig_F**2 * params.R_F**2) * int_trapz(g2, dx=params.dt))
-    print(var_paths.mean().item(), params.lamb_L)
     return var_paths.mean().item()
