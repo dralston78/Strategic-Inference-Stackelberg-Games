@@ -219,6 +219,20 @@ def compute_f_grid(params):
     f_grid = params.A_F - 2 * (params.B_F**2) / params.R_F * a_grid
     return f_grid
 
+def compute_h_grid(params):
+    f_grid = compute_f_grid(params)
+    F_int = torch.cumsum(f_grid[:-1], 0) * params.dt
+    F_int = torch.cat([torch.tensor([0.0], device=params.device), F_int])
+    h_grid = params.Q_F * torch.exp(F_int)
+    return h_grid
+
+def compute_k_grid(params):
+    f_grid = compute_f_grid(params)
+    F_int = torch.cumsum(f_grid[:-1], 0) * params.dt
+    F_int = torch.cat([torch.tensor([0.0], device=params.device), F_int])
+    k_grid = torch.exp(-2.0 * F_int)
+    return k_grid
+
 def compute_b_grid(params, a_grid, X_L):
     B, L = X_L.shape
     b_next = X_L.new_zeros(B)
@@ -568,3 +582,4 @@ def estimate_var(X_L_paths, params):
     g2 = (b / params.M_true) ** 2
     var_paths = 1/((params.B_F**4)/(params.sig_F**2 * params.R_F**2) * int_trapz(g2, dx=params.dt))
     return var_paths.mean().item()
+
