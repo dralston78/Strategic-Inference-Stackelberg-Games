@@ -389,7 +389,7 @@ class LeaderLBSolver:
             Z = Z + self.k_grid[k] * Y * params.dt
             X += (params.A_L * X + params.B_L * u) * params.dt + params.sig_L * dW[:, k]
             Xs[:, k + 1] = X
-        return Xs[:, 1:], Us[:, 1:]
+        return Xs[:, 1:-1], Us[:, 1:-1]
 
 def exact_leader_total_cost(X_L, U_L, params, F):
     """total cost (not lower bound approx)"""
@@ -427,7 +427,7 @@ def simulate_leader(control, params, batch, seed):
         U_L[:, k] = u
 
         X_L[:, k + 1] = X_L[:, k] + (params.A_L * X_L[:, k] + params.B_L * u) * params.dt + params.sig_L * dW[:, k]
-    X_L, U_L = X_L[:, 1:], U_L[:, 1:]
+    X_L, U_L = X_L[:, 1:-1], U_L[:, 1:-1]
     X_L[:, 0] = torch.full((batch,), params.X_L_0, device=params.device)
     return X_L, U_L
 
