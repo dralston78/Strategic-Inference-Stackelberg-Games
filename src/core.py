@@ -12,6 +12,8 @@ import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 from dataclasses import dataclass
 
+torch.set_default_dtype(torch.float64)
+
 @dataclass
 class SystemParams():
     A_L, A_F = None, None
@@ -211,7 +213,7 @@ def compute_a_grid(params):
                         t_eval=np.linspace(params.T, 0.0, params.N + 1),
                         rtol=1e-8, atol=1e-8)
         # return torch.tensor(sol.y[0][::-1].copy(), dtype=torch.float32, device=params.device)
-        params.a_grid = torch.tensor(sol.y[0][::-1].copy(), dtype=torch.float32, device=params.device)
+        params.a_grid = torch.tensor(sol.y[0][::-1].copy(), dtype=torch.float64, device=params.device)
         return params.a_grid
 
 def compute_f_grid(params):
