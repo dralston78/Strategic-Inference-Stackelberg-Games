@@ -172,7 +172,6 @@ class DeepLSTMController(nn.Module):
         feats.append(self._build_time_feats(tau))
         return torch.cat([f if f.dim() == 2 else f.view(B, -1) for f in feats], dim=1)
 
-    # ---------------------------------------------------------
     def forward(self, tau, x):
         """
         tau, x : (B,)
