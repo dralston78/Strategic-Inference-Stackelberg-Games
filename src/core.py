@@ -203,6 +203,83 @@ class DeepLSTMController(nn.Module):
             return torch.relu(u)
         return u
     
+# class DeepLSTMController(nn.Module):
+#     def __init__(self, hidden, num_layers):
+#         super().__init__()
+#         self.hidden = hidden
+#         self.num_layers = num_layers
+
+#         self.lag_steps = 4
+#         self.decay = 0.95
+
+#         # current x + (lag_steps-1) past x + lag_steps weighted history + ema + time feats (t,sin,cos)
+#         feat_dim = 1 + (self.lag_steps - 1) + self.lag_steps + 1 + 3
+
+#         self.rnn = nn.LSTM(feat_dim,
+#                            hidden, 
+#                            num_layers,
+#                            dropout=0.0,
+#                            batch_first=True
+#                         )
+#         self.head = nn.Sequential(
+#             nn.Linear(hidden, hidden//2),
+#             nn.SiLU(),
+#             nn.Linear(hidden//2, 1)
+#         )
+
+#         self.h0 = nn.Parameter(torch.zeros(self.num_layers, 1, self.hidden))
+#         self.c0 = nn.Parameter(torch.zeros(self.num_layers, 1, self.hidden))
+
+#         self._has_init = False
+#         self.step = 0
+
+#     def reset_state(self, batch_size):
+#         device = self.h0.device  # Get device from model parameters
+#         self.h = (self.h0.expand(-1, batch_size, -1).contiguous(),
+#                   self.c0.expand(-1, batch_size, -1).contiguous())
+#         self.step = 0
+#         self.x_lag = torch.zeros(batch_size, self.lag_steps, device=device)
+#         self.wgt_hist = torch.zeros(batch_size, self.lag_steps, device=device)
+#         self.ema = torch.zeros(batch_size, device=device)
+#         self._has_init = True
+
+#     def _assemble_features(self,t,x,warmup_mode=False):
+#         # x: (B,)
+#         if self.step == 0 and not warmup_mode:
+#             self.x_lag[:] = x.unsqueeze(1).expand(-1, self.lag_steps)
+#             self.wgt_hist[:] = x.unsqueeze(1).expand(-1, self.lag_steps)
+#             self.ema[:] = x
+        
+#         if self.step > 0 and not warmup_mode:
+#             self.x_lag[:,:-1].copy_(self.x_lag[:,1:].clone())
+#             self.x_lag[:,-1] = x
+#             self.wgt_hist[:,:-1].copy_((self.wgt_hist[:,1:]*self.decay).clone())
+#             self.wgt_hist[:,-1] = x
+#             # Ensure decay operations use tensors on the same device as x
+#             decay_tensor = torch.tensor(self.decay, device=x.device, dtype=x.dtype)
+#             self.ema = self.ema * decay_tensor + x * (1 - decay_tensor)
+        
+#         feats = [x, self.x_lag[:,:-1], self.wgt_hist, self.ema, self._build_time_feats(t)]
+#         feats = [f if f.dim() == 2 else f.view(x.size(0), -1) for f in feats]
+#         feats = torch.cat(feats, dim=-1)
+#         return feats
+
+#     def _build_time_feats(self,t):
+#         feats = [t, torch.sin(t), torch.cos(t)]
+#         feats = torch.stack(feats, dim=-1)
+#         return feats
+    
+#     def forward(self, t, x):
+#         if not self._has_init:
+#             self.reset_state(x.shape[0])
+
+#         feat = self._assemble_features(t,x)
+#         # rnn feature expects (B, seq_len, feat_dim)
+#         out, self.h = self.rnn(feat.unsqueeze(1), self.h)
+#         u = self.head(out.squeeze(1)).squeeze(-1)
+#         self.step += 1
+#         return u
+    
 def compute_a_grid(params):
     if getattr(params, 'a_grid', None) is not None:
         return params.a_grid
@@ -455,10 +532,21 @@ def int_trapz(y, dx):
 
 def train_net(net, params, F, exact, epochs, batch_size, lr, starting_spread, plateau_factor, plateau_patience, plateau_thresh, min_lr, print_every):
 
+    analytical_cost = None
+    if not exact:
+        leader_lb_analytical = LeaderLBSolver(params, F)
+        analytical_X, analytical_U = leader_lb_analytical.simulate(10000, seed=42)
+        analytical_cost = lb_leader_total_cost(analytical_X, analytical_U, params, F)
+
+    seed = 42
+    torch.manual_seed(seed)
     common_words = top_n_list('en', n=20000,)
     run_words = random.sample(common_words, 2)
     run_id = "_".join(run_words)
-    base_dir = "src/runs"
+    print('-'*20)
+    print(f"Run ID: {run_id}")
+    print('-'*20)
+    base_dir = "sym_notebooks/runs"
     if not os.path.exists(base_dir):
         os.makedirs(base_dir)
     run_dir = os.path.join(base_dir, run_id)
@@ -500,9 +588,16 @@ def train_net(net, params, F, exact, epochs, batch_size, lr, starting_spread, pl
 
     net.to(params.device)
     opt = optim.AdamW(net.parameters(), lr)
-    sched = optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode="min", factor=plateau_factor, patience=plateau_patience,
-        threshold=plateau_thresh, min_lr=min_lr, verbose=False)
+    # sched = optim.lr_scheduler.ReduceLROnPlateau(
+    #     opt, mode="min", factor=plateau_factor, patience=plateau_patience,
+    #     threshold=plateau_thresh, min_lr=min_lr, verbose=False)
+
+    lr_schedule = {
+        1: lr,         # initial learning rate at update 1
+        600: lr * 0.1, # for example: half the learning rate at update 500
+        # 1500: lr * 0.1 # 10% of the initial lr at update 1000
+        # add more entries as needed
+    }
 
     # w_pen = 0.1 + 0.9 * torch.arange(N, device=device) / N
     w_pen = 1
@@ -511,6 +606,7 @@ def train_net(net, params, F, exact, epochs, batch_size, lr, starting_spread, pl
     for upd in range(1, epochs + 1):
         opt.zero_grad()
         dW = torch.randn(batch_size, params.N, device=params.device) * params.dt**0.5
+        dW[:, 0] = 0.0  # no noise at t=0
         X = torch.empty((batch_size, 1), device=params.device).uniform_(params.X_L_0 - starting_spread, params.X_L_0 + starting_spread)
         U = []
         if hasattr(net, 'reset_state'):
@@ -528,10 +624,15 @@ def train_net(net, params, F, exact, epochs, batch_size, lr, starting_spread, pl
         else:
             loss = lb_leader_total_cost(X, U, params, F)
         loss.backward()
-            
-        clip_grad = 1.0
-        nn.utils.clip_grad_norm_(net.parameters(), clip_grad)
         opt.step()
+
+        # Adjust learning rate if the current update is in the schedule.
+        if upd in lr_schedule:
+            new_lr = lr_schedule[upd]
+            for param_group in opt.param_groups:
+                param_group['lr'] = new_lr
+            print(f"Update {upd}: learning rate adjusted to {new_lr:.2e}")
+
 
         loss_val = None
         if upd % print_every == 0:
@@ -542,7 +643,7 @@ def train_net(net, params, F, exact, epochs, batch_size, lr, starting_spread, pl
                     print(f"[{upd}] MC‑Exact = {loss_val:+.3e} LR = {opt.param_groups[0]['lr']:.2e} ")
                 else:
                     loss_val = lb_leader_total_cost(X_eval, U_eval, params, F)
-                    print(f"[{upd}] MC‑LB = {loss_val:+.3e} LR = {opt.param_groups[0]['lr']:.2e} ")
+                    print(f"[{upd}] MC‑LB = {loss_val:+.3e} LR = {opt.param_groups[0]['lr']:.2e} True Cost = {analytical_cost:+.3e}" )
 
         loss_val = loss_val.item()
         if len(best_losses) < 10 or loss_val < best_losses[-1][0]:
@@ -550,7 +651,7 @@ def train_net(net, params, F, exact, epochs, batch_size, lr, starting_spread, pl
             best_losses.append((loss_val, upd, sd_clone))
             best_losses = sorted(best_losses, key=lambda x: x[0])[:10]
 
-        sched.step(loss_val)
+        # sched.step(loss_val)
         losses.append(loss_val)
 
 
@@ -564,6 +665,18 @@ def train_net(net, params, F, exact, epochs, batch_size, lr, starting_spread, pl
         json.dump({
             "losses": [float(loss) for loss in losses],
         }, f, indent=4)
+
+    leader_analytic = LeaderLBSolver(params, F)
+    X_L_a, U_L_a = leader_analytic.simulate(batch=10, seed=seed)
+    X_L_nn, U_L_nn = simulate_leader(make_nn_policy(net, params), params, batch=10, seed=seed)
+
+    # plt.plot(torch.linspace, U_L_a[0].cpu().detach().numpy())
+    for i in range(3):
+        plt.plot(torch.linspace(0, params.T, U_L_a.shape[1], device=params.device).cpu().detach().numpy(), U_L_a[i, :].cpu().detach().numpy(), label=f"U_L_a[{i}]", linestyle='-', color=f"C{i}")
+        plt.plot(torch.linspace(0, params.T, U_L_nn.shape[1], device=params.device).cpu().detach().numpy(), U_L_nn[i, :].cpu().detach().numpy(), label=f"X_L_nn[{i}]", linestyle='--', color=f"C{i}")
+    plt.savefig(os.path.join(run_dir, "control_comparison.png"))
+    plt.close()
+
     return net
 
 @torch.no_grad()
